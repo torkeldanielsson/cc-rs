@@ -50,6 +50,7 @@ unexpected_cfgs = { level = "allow", check-cfg = ['cfg(disable_clang_cl_tests)']
 [dependencies]
 find-msvc-tools = { path = "find-msvc-tools", version = "0.1.11" }
 jobserver = { version = "0.1.30", default-features = false, optional = true }
+json = { version = "0.12", optional = true }
 shlex = "2.0.1"
 
 [dev-dependencies]
@@ -65,6 +66,7 @@ libc = { version = "0.2.168", default-features = false, optional = true }
 # so that they aren't broken. This has never enabled `parallel`, so we won't do that.
 jobserver = []
 parallel = ["dep:jobserver", "dep:libc"]
+track-dependencies = ["dep:json"]
 
 [lints]
 workspace = true

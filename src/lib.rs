@@ -228,12 +228,15 @@
 //!
 //! # Speed up compilation with sccache
 //!
-//! `cc-rs` does not handle incremental compilation like `make` or `ninja`. It
-//! always compiles the all sources, no matter if they have changed or not.
-//! This would be time-consuming in large projects. To save compilation time,
-//! you can use [sccache](https://github.com/mozilla/sccache) by setting
-//! environment variable `RUSTC_WRAPPER=sccache`, which will use cached `.o`
-//! files if the sources are unchanged.
+//! By default, `cc-rs` does not handle incremental compilation like `make` or
+//! `ninja`: it compiles all sources whenever the build script runs. The
+//! optional `track-dependencies` feature adds compiler-generated dependency
+//! tracking; enable it and call `Build::track_dependencies` to reuse current
+//! object files and emit Cargo rebuild metadata for included headers.
+//!
+//! Alternatively, you can use [sccache](https://github.com/mozilla/sccache) by
+//! setting the `RUSTC_WRAPPER=sccache` environment variable, which will use
+//! cached object files when the sources are unchanged.
 
 #![doc(html_root_url = "https://docs.rs/cc/1.0")]
 
@@ -338,6 +341,9 @@ pub mod windows_registry {
 mod command_helpers;
 use command_helpers::*;
 
+#[cfg(feature = "track-dependencies")]
+mod track_dependencies;
+
 mod tool;
 pub use tool::Tool;
 use tool::{CompilerFamilyLookupCache, ToolFamily};
@@ -423,6 +429,8 @@ pub struct Build {
     inherit_rustflags: bool,
     inherit_trim_paths: bool,
     prefer_clang_cl_over_msvc: bool,
+    #[cfg(feature = "track-dependencies")]
+    track_dependencies: bool,
 }
 
 /// Represents the types of errors that may occur while using cc-rs.
@@ -494,6 +502,12 @@ struct Object {
     dst: PathBuf,
 }
 
+struct CompileObjectCommand {
+    command: Command,
+    #[cfg(feature = "track-dependencies")]
+    dependency_file: Option<track_dependencies::DependencyFile>,
+}
+
 impl Object {
     /// Create a new source file -> object file pair.
     fn new(src: PathBuf, dst: PathBuf) -> Object {
@@ -553,6 +567,8 @@ impl Build {
             inherit_rustflags: true,
             inherit_trim_paths: true,
             prefer_clang_cl_over_msvc: false,
+            #[cfg(feature = "track-dependencies")]
+            track_dependencies: false,
         }
     }
 
@@ -1357,6 +1373,23 @@ impl Build {
         self
     }
 
+    /// Enables compiler-generated source and header dependency tracking.
+    ///
+    /// When enabled, `cc` asks the compiler to write a dependency file for
+    /// each C or C++ source. On later build-script runs, an object is only
+    /// recompiled when its compiler command changed or one of its inputs is at
+    /// least as new as the object. The discovered inputs are also emitted as
+    /// `cargo:rerun-if-changed` metadata, except for generated inputs located
+    /// under `OUT_DIR`.
+    ///
+    /// Assembly sources are emitted as Cargo inputs but are always recompiled
+    /// when the build script runs. This option defaults to `false`.
+    #[cfg(feature = "track-dependencies")]
+    pub fn track_dependencies(&mut self, track_dependencies: bool) -> &mut Build {
+        self.track_dependencies = track_dependencies;
+        self
+    }
+
     /// Configures whether the /MT flag or the /MD flag will be passed to msvc build tools.
     ///
     /// This option defaults to `false`, and affect only msvc targets.
@@ -1635,6 +1668,8 @@ impl Build {
         let objects = objects_from_files(&self.files, &dst)?;
 
         self.compile_objects(&objects)?;
+        #[cfg(feature = "track-dependencies")]
+        self.emit_dependency_metadata(&objects, &dst)?;
         self.assemble(lib_name, &dst.join(gnu_lib_name), &objects)?;
 
         let target = self.get_target()?;
@@ -1845,6 +1880,8 @@ impl Build {
         let objects = objects_from_files(&self.files, &dst)?;
 
         self.compile_objects(&objects)?;
+        #[cfg(feature = "track-dependencies")]
+        self.emit_dependency_metadata(&objects, &dst)?;
 
         Ok(objects.into_iter().map(|v| v.dst).collect())
     }
@@ -1855,6 +1892,11 @@ impl Build {
                 ErrorKind::Disabled,
                 "the `cc` crate's functionality has been disabled by the `CC_FORCE_DISABLE` environment variable.",
             ));
+        }
+
+        #[cfg(feature = "track-dependencies")]
+        if self.track_dependencies {
+            return self.compile_objects_tracked(objs);
         }
 
         #[cfg(feature = "parallel")]
@@ -1873,7 +1915,91 @@ impl Build {
         Ok(())
     }
 
+    #[cfg(feature = "track-dependencies")]
+    fn compile_objects_tracked(&self, objects: &[Object]) -> Result<(), Error> {
+        let mut commands = Vec::new();
+        let mut command_stamps = Vec::new();
+
+        for object in objects {
+            let compile = self.create_compile_object_command(object)?;
+            match compile.dependency_file {
+                Some(dependency_file) => {
+                    let command_stamp =
+                        track_dependencies::CommandStamp::new(object, &compile.command);
+                    if track_dependencies::is_run_needed(object, &dependency_file, &command_stamp) {
+                        commands.push(compile.command);
+                        command_stamps.push(command_stamp);
+                    }
+                }
+                // The dependency file formats used here do not cover assembly.
+                // Preserve cc's existing behavior and compile it every time the
+                // build script runs.
+                None => commands.push(compile.command),
+            }
+        }
+
+        #[cfg(feature = "parallel")]
+        if commands.len() > 1 {
+            let mut commands = commands.into_iter().map(Ok::<Command, Error>);
+            parallel::run_commands_in_parallel(&self.cargo_output, &mut commands)?;
+            for command_stamp in command_stamps {
+                command_stamp.persist();
+            }
+            return Ok(());
+        }
+
+        for mut command in commands {
+            run(&mut command, &self.cargo_output)?;
+        }
+        for command_stamp in command_stamps {
+            command_stamp.persist();
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "track-dependencies")]
+    fn emit_dependency_metadata(&self, objects: &[Object], out_dir: &Path) -> Result<(), Error> {
+        if !self.track_dependencies {
+            return Ok(());
+        }
+
+        let compiler_family = self.try_get_compiler()?.family;
+        let out_dir = track_dependencies::canonical_path(out_dir);
+        let mut unique_dependencies = std::collections::HashSet::new();
+
+        for object in objects {
+            let mut dependencies = vec![object.src.clone()];
+            if AsmFileExt::from_path(&object.src).is_none() {
+                let dependency_file =
+                    track_dependencies::DependencyFile::for_compiler(object, compiler_family);
+                if let Some(discovered) = dependency_file.dependencies(object) {
+                    dependencies.extend(discovered);
+                }
+            }
+
+            for dependency in dependencies {
+                let Some(identity) =
+                    track_dependencies::external_dependency_identity(&dependency, &out_dir)
+                else {
+                    continue;
+                };
+                if !unique_dependencies.insert(identity) {
+                    continue;
+                }
+                self.cargo_output.print_metadata(&format_args!(
+                    "cargo:rerun-if-changed={}",
+                    dependency.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn create_compile_object_cmd(&self, obj: &Object) -> Result<Command, Error> {
+        Ok(self.create_compile_object_command(obj)?.command)
+    }
+
+    fn create_compile_object_command(&self, obj: &Object) -> Result<CompileObjectCommand, Error> {
         let asm_ext = AsmFileExt::from_path(&obj.src);
         let is_asm = asm_ext.is_some();
         let target = self.get_target()?;
@@ -1911,6 +2037,16 @@ impl Build {
             cmd.args(self.asm_flags.iter().map(std::ops::Deref::deref));
         }
 
+        #[cfg(feature = "track-dependencies")]
+        let dependency_file = if self.track_dependencies && !is_asm {
+            let dependency_file =
+                track_dependencies::DependencyFile::for_compiler(obj, compiler.family);
+            dependency_file.add_compiler_flags(&mut cmd, compiler.family);
+            Some(dependency_file)
+        } else {
+            None
+        };
+
         if compiler.supports_path_delimiter() && !is_assembler_msvc {
             // #513: For `clang-cl`, separate flags/options from the input file.
             // When cross-compiling macOS -> Windows, this avoids interpreting
@@ -1924,7 +2060,11 @@ impl Build {
             self.fix_env_for_apple_os(&mut cmd)?;
         }
 
-        Ok(cmd)
+        Ok(CompileObjectCommand {
+            command: cmd,
+            #[cfg(feature = "track-dependencies")]
+            dependency_file,
+        })
     }
 
     /// This will return a result instead of panicking; see [`Self::expand()`] for
