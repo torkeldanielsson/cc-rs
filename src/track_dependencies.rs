@@ -196,22 +196,64 @@ fn parse_makefile_words(contents: &str) -> Vec<PathBuf> {
     let mut dependencies = Vec::new();
     let mut word = String::new();
     let mut chars = contents.chars().peekable();
+    let mut windows_path = false;
 
     while let Some(ch) = chars.next() {
         match ch {
-            '\\' => match chars.next() {
-                Some('\n') => {}
-                Some('\r') if chars.peek() == Some(&'\n') => {
+            '\\' => {
+                let Some(next) = chars.peek().copied() else {
+                    word.push('\\');
+                    continue;
+                };
+
+                if next == '\n' {
                     chars.next();
+                    continue;
                 }
-                Some(escaped) => word.push(escaped),
-                None => word.push('\\'),
-            },
+                if next == '\r' {
+                    chars.next();
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    } else {
+                        word.push('\\');
+                        word.push('\r');
+                    }
+                    continue;
+                }
+
+                let bytes = word.as_bytes();
+                let drive_prefix =
+                    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+                if !windows_path && drive_prefix {
+                    windows_path = true;
+                    word.push('\\');
+                    continue;
+                }
+                if !windows_path && word.is_empty() && next == '\\' {
+                    windows_path = true;
+                    word.push('\\');
+                    word.push(chars.next().unwrap());
+                    continue;
+                }
+
+                // A backslash only quotes characters that are special to a
+                // Makefile. Before an ordinary character it is part of the
+                // path, most notably in native Windows paths. Preserve doubled
+                // separators in Windows paths as well, including UNC paths.
+                if windows_path && next == '\\' {
+                    word.push('\\');
+                } else if next == '#' || next == ':' || next.is_whitespace() || next == '\\' {
+                    word.push(chars.next().unwrap());
+                } else {
+                    word.push('\\');
+                }
+            }
             '#' => break,
             whitespace if whitespace.is_whitespace() => {
                 if !word.is_empty() {
                     dependencies.push(PathBuf::from(std::mem::take(&mut word)));
                 }
+                windows_path = false;
             }
             other => word.push(other),
         }
@@ -253,6 +295,31 @@ mod tests {
     #[test]
     fn finds_rule_separator_after_windows_drive_prefix() {
         assert_eq!(find_rule_separator("C:/out/foo.o: C:/src/foo.c"), Some(12));
+        assert_eq!(find_rule_separator(r"C:\out\foo.o: C:\src\foo.c"), Some(12));
+    }
+
+    #[test]
+    fn parses_native_windows_dependency_paths() {
+        let dependencies = parse_makefile_depfile(
+            r"C:\out\foo.o: C:\src\main.c C:\Program\ Files\SDK\header.h \\server\share\shared.h",
+        )
+        .unwrap();
+
+        assert_eq!(
+            dependencies,
+            [
+                PathBuf::from(r"C:\src\main.c"),
+                PathBuf::from(r"C:\Program Files\SDK\header.h"),
+                PathBuf::from(r"\\server\share\shared.h"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_makefile_escaped_literal_backslash() {
+        let dependencies = parse_makefile_depfile(r"out.o: include/with\\backslash.h").unwrap();
+
+        assert_eq!(dependencies, [PathBuf::from(r"include/with\backslash.h")]);
     }
 
     #[test]
