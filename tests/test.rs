@@ -492,8 +492,138 @@ fn msvc_smoke() {
         .must_not_have("-Z7")
         .must_have("-c")
         .must_have("-MD");
-    test.cmd(1)
-        .must_have(test.td.path().join("db3b6bfb95261072-foo.o"));
+    if cfg!(windows) {
+        let response_file = test.td.path().join("libfoo.rsp");
+        test.cmd(1)
+            .must_have(format!("@{}", response_file.display()));
+        let objects = std::fs::read_to_string(response_file).unwrap();
+        assert!(objects.starts_with('\u{feff}'));
+        assert!(objects.contains("db3b6bfb95261072-foo.o"));
+    } else {
+        test.cmd(1)
+            .must_have(test.td.path().join("db3b6bfb95261072-foo.o"));
+    }
+}
+
+/// Source files whose object paths contain spaces and non-ASCII characters and
+/// together exceed 4000 characters.
+fn long_unicode_sources() -> Vec<String> {
+    (0..30)
+        .map(|i| format!("src dir/ünï côde 日本語 {i:02} {}.c", "x".repeat(120)))
+        .collect()
+}
+
+/// The archiver invocations recorded after the `compiles` compiler invocations.
+fn archiver_invocations(test: &Test, compiles: usize) -> Vec<support::Execution> {
+    (compiles..)
+        .take_while(|i| test.td.path().join(format!("out{i}")).exists())
+        .map(|i| test.cmd(i))
+        .collect()
+}
+
+#[cfg(windows)]
+#[test]
+fn msvc_lib_exe_response_file_with_many_unicode_paths() {
+    let test = Test::msvc();
+    let sources = long_unicode_sources();
+    let mut build = test.gcc();
+    for source in &sources {
+        build.file(source);
+    }
+    build.compile("foo");
+
+    let archives = archiver_invocations(&test, sources.len());
+    assert_eq!(archives.len(), 1, "{archives:?}");
+    let response_file = test.td.path().join("libfoo.rsp");
+    archives[0].must_have(format!("@{}", response_file.display()));
+    let contents = std::fs::read_to_string(&response_file).unwrap();
+    let lines: Vec<&str> = contents.strip_prefix('\u{feff}').unwrap().lines().collect();
+    assert_eq!(lines.len(), sources.len());
+    assert!(contents.len() > 4000);
+    for line in &lines {
+        assert!(line.starts_with('"') && line.ends_with('"'), "{line}");
+        let path = &line[1..line.len() - 1];
+        assert!(path.starts_with(test.td.path().to_str().unwrap()), "{path}");
+        assert!(path.contains("ünï côde 日本語"), "{path}");
+    }
+    assert!(std::fs::read(&response_file)
+        .unwrap()
+        .starts_with(&[0xEF, 0xBB, 0xBF]));
+}
+
+#[test]
+fn msvc_unknown_archiver_wrapper_keeps_direct_batches() {
+    let test = Test::msvc();
+    test.shim("lib-wrapper.exe");
+    let sources = long_unicode_sources();
+    let mut build = test.gcc();
+    build.archiver(test.td.path().join("lib-wrapper.exe"));
+    for source in &sources {
+        build.file(source);
+    }
+    build.compile("foo");
+
+    let archives = archiver_invocations(&test, sources.len());
+    assert!(archives.len() > 1, "{archives:?}");
+    let mut objects = 0;
+    for archive in &archives {
+        assert!(
+            !archive.args.iter().any(|arg| arg.starts_with('@')),
+            "{archive:?}"
+        );
+        let batch: Vec<&String> = archive
+            .args
+            .iter()
+            .filter(|arg| arg.ends_with(".o"))
+            .collect();
+        // The batch is bounded to about 4000 characters, plus the object that crosses it.
+        assert!(batch.iter().map(|arg| arg.len()).sum::<usize>() < 4000 + 400);
+        objects += batch.len();
+    }
+    assert_eq!(objects, sources.len());
+    assert!(!test.td.path().join("libfoo.rsp").exists());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn msvc_lib_exe_on_non_windows_host_uses_no_response_file() {
+    let test = Test::msvc();
+    let sources = long_unicode_sources();
+    let mut build = test.gcc();
+    for source in &sources {
+        build.file(source);
+    }
+    build.compile("foo");
+
+    let archives = archiver_invocations(&test, sources.len());
+    // msvc-wine style hosts keep 4000-character batches and direct arguments.
+    assert!(archives.len() > 1, "{archives:?}");
+    for archive in &archives {
+        assert!(
+            !archive.args.iter().any(|arg| arg.starts_with('@')),
+            "{archive:?}"
+        );
+    }
+    assert!(!test.td.path().join("libfoo.rsp").exists());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn gnu_ar_on_non_windows_host_archives_in_one_call() {
+    let test = Test::gnu();
+    let sources = long_unicode_sources();
+    let mut build = test.gcc();
+    for source in &sources {
+        build.file(source);
+    }
+    build.compile("foo");
+
+    // Over 4000 characters of objects fit one `ar cqD` plus the final `ar sD`.
+    let archives = archiver_invocations(&test, sources.len());
+    assert_eq!(archives.len(), 2, "{archives:?}");
+    archives[0].must_have("cqD");
+    assert!(!archives[0].args.iter().any(|arg| arg.starts_with('@')));
+    assert!(!test.td.path().join("libfoo.rsp").exists());
 }
 
 #[test]

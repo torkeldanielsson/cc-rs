@@ -34,6 +34,7 @@ const FLAG_SUPPORTED_PROBES: &str = "flag-supported-probe";
 const AR_DETECTION_PROBES: &str = "ar-detection-probe";
 const PROBE_SLOTS: usize = 4;
 
+#[derive(Debug)]
 pub struct Execution {
     pub args: Vec<String>,
 }
